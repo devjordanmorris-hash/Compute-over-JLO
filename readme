@@ -1,18 +1,1 @@
-# Triangle Arithmetic – 4x faster base-4 borrow propagation with NEON
-
-```c
-#include <triangle.h>
-
-// Process 1 million triangles in 35ms on M2
-Triangle tri[1000000];
-uint64_t borrows[1000000];
-triangle_borrow_batch(tri, 1000000, borrows);
-
-## Build
-
-```bash
-git clone https://github.com/devjordanmorris-hash/Compute-over-JLO
-cd Compute-over-JLO
-make          # builds both scalar and NEON
-make test     # runs correctness tests
-make bench    # shows 4x speedup on M1/M2/M3
+GPU VERSION
