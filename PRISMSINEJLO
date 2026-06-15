@@ -1,0 +1,246 @@
+# prism_sine_gpu.ipynb
+# Run this in Google Colab (Runtime → Change runtime type → GPU)
+
+import numpy as np
+import cupy as cp
+import time
+import math
+
+# ============================================================
+# PRISM SINE GENERATION (CPU)
+# ============================================================
+
+def build_sine_prisms(samples, tile_size):
+    """Build prism coefficients for sine wave"""
+    TAU = 2 * math.pi
+    dtheta = TAU / samples
+    num_prisms = samples // tile_size
+    prisms = np.zeros((num_prisms, 4), dtype=np.float32)  # a0,a1,a2,a3
+
+    for i in range(num_prisms):
+        start = i * tile_size
+        end = start + tile_size - 1
+
+        t0 = start * dtheta
+        t1 = end * dtheta
+
+        y0 = math.sin(t0)
+        y1 = math.sin(t1)
+        dy0 = math.cos(t0) * dtheta
+        dy1 = math.cos(t1) * dtheta
+
+        m0 = dy0 * (tile_size - 1)
+        m1 = dy1 * (tile_size - 1)
+
+        c0 = y0
+        c1 = m0
+        c2 = 3*(y1-y0) - 2*m0 - m1
+        c3 = 2*(y0-y1) + m0 + m1
+
+        s = 1.0 / (tile_size - 1)
+        s2 = s * s
+        s3 = s2 * s
+
+        prisms[i] = [c0, c1*s, c2*s2, c3*s3]
+
+    return prisms
+
+# ============================================================
+# PRISM EVALUATION KERNELS (GPU)
+# ============================================================
+
+@cp.fuse()
+def eval_prism_scalar(a0_vals, a1_vals, a2_vals, a3_vals, k_array):
+    """Scalar evaluation - one value per thread"""
+    # prism_idx and k are now pre-calculated and passed in
+
+    x = k_array.astype(cp.float32)
+    return ((a3_vals * x + a2_vals) * x + a1_vals) * x + a0_vals
+
+@cp.fuse()
+def eval_prism_vec4(a0_vals_quads, a1_vals_quads, a2_vals_quads, a3_vals_quads, k_quads):
+    """Vectorized - each thread processes 4 values"""
+    # prism_idx and k_quads are now pre-calculated and passed in
+
+    # 4 consecutive positions
+    x0 = k_quads.astype(cp.float32)
+    x1 = x0 + 1.0
+    x2 = x0 + 2.0
+    x3 = x0 + 3.0
+
+    out0 = ((a3_vals_quads * x0 + a2_vals_quads) * x0 + a1_vals_quads) * x0 + a0_vals_quads
+    out1 = ((a3_vals_quads * x1 + a2_vals_quads) * x1 + a1_vals_quads) * x1 + a0_vals_quads
+    out2 = ((a3_vals_quads * x2 + a2_vals_quads) * x2 + a1_vals_quads) * x2 + a0_vals_quads
+    out3 = ((a3_vals_quads * x3 + a2_vals_quads) * x3 + a1_vals_quads) * x3 + a0_vals_quads
+
+    return out0, out1, out2, out3
+
+# ============================================================
+# BENCHMARK FUNCTION
+# ============================================================
+
+def benchmark(samples=32768, tile_size=256, iterations=1000):
+    print(f"{'='*60}")
+    print(f"PRISM SINE GPU BENCHMARK")
+    print(f"Samples: {samples}, Tile: {tile_size}, Iterations: {iterations}")
+    print(f"{'='*60}\n")
+
+    # Build prisms
+    print("Building prisms...")
+    prisms = build_sine_prisms(samples, tile_size)
+    num_prisms = samples // tile_size
+    print(f"Created {num_prisms} prisms, {prisms.nbytes/1024:.1f} KB\n")
+
+    # Move to GPU and split into individual coefficient arrays
+    prisms_gpu = cp.asarray(prisms)
+    prisms_a0_gpu = prisms_gpu[:, 0]
+    prisms_a1_gpu = prisms_gpu[:, 1]
+    prisms_a2_gpu = prisms_gpu[:, 2]
+    prisms_a3_gpu = prisms_gpu[:, 3]
+
+    # ===== CPU sinf() baseline =====
+    print("--- CPU sinf() baseline ---")
+    TAU = 2 * math.pi
+    cpu_times = []
+    for _ in range(10):  # 10 iterations for stable measurement
+        t0 = time.perf_counter()
+        for _ in range(iterations // 10):
+            cpu_out = np.sin(np.arange(samples) * TAU / samples)
+        t1 = time.perf_counter()
+        cpu_times.append((t1 - t0) * 1000)  # ms
+    cpu_ms = np.mean(cpu_times)
+    cpu_mvals = (iterations * samples / 1e6) / (cpu_ms / 1000)
+    print(f"Time: {cpu_ms:.2f} ms")
+    print(f"Speed: {cpu_mvals:.2f} M vals/sec\n")
+
+    # Create index arrays once outside the fused kernels
+    gpu_idx_scalar = cp.arange(samples, dtype=cp.int32)
+    num_quads = samples // 4
+    gpu_idx_vec4 = cp.arange(num_quads, dtype=cp.int32)
+
+    # Pre-calculate prism indices and k values for scalar kernel
+    prism_idx_scalar = gpu_idx_scalar // tile_size
+    k_scalar = gpu_idx_scalar % tile_size
+    a0_vals_scalar = prisms_a0_gpu[prism_idx_scalar]
+    a1_vals_scalar = prisms_a1_gpu[prism_idx_scalar]
+    a2_vals_scalar = prisms_a2_gpu[prism_idx_scalar]
+    a3_vals_scalar = prisms_a3_gpu[prism_idx_scalar]
+
+    # Pre-calculate prism indices and k values for vec4 kernel
+    base_idx_vec4 = gpu_idx_vec4 * 4
+    prism_idx_vec4 = base_idx_vec4 // tile_size
+    k_vec4 = base_idx_vec4 % tile_size
+    a0_vals_vec4 = prisms_a0_gpu[prism_idx_vec4]
+    a1_vals_vec4 = prisms_a1_gpu[prism_idx_vec4]
+    a2_vals_vec4 = prisms_a2_gpu[prism_idx_vec4]
+    a3_vals_vec4 = prisms_a3_gpu[prism_idx_vec4]
+
+    # ===== GPU: Scalar kernel =====
+    print("--- GPU: Scalar kernel ---")
+    # Warmup
+    for _ in range(5):
+        out = eval_prism_scalar(a0_vals_scalar, a1_vals_scalar, a2_vals_scalar, a3_vals_scalar, k_scalar)
+        cp.cuda.Stream.null.synchronize()
+
+    gpu_times = []
+    for _ in range(10):
+        cp.cuda.Stream.null.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iterations):
+            out = eval_prism_scalar(a0_vals_scalar, a1_vals_scalar, a2_vals_scalar, a3_vals_scalar, k_scalar)
+        cp.cuda.Stream.null.synchronize()
+        t1 = time.perf_counter()
+        gpu_times.append((t1 - t0) * 1000)
+    gpu_ms = np.mean(gpu_times)
+    gpu_mvals = (iterations * samples / 1e6) / (gpu_ms / 1000)
+    print(f"Time: {gpu_ms:.2f} ms")
+    print(f"Speed: {gpu_mvals:.2f} M vals/sec")
+    print(f"Speedup vs CPU: {cpu_mvals / gpu_mvals:.2f}x\n")
+
+    # ===== GPU: Vec4 kernel =====
+    print("--- GPU: Vec4 kernel ---")
+    for _ in range(5):
+        out0, out1, out2, out3 = eval_prism_vec4(a0_vals_vec4, a1_vals_vec4, a2_vals_vec4, a3_vals_vec4, k_vec4)
+        out = cp.empty(samples, dtype=cp.float32)
+        out[0::4] = out0
+        out[1::4] = out1
+        out[2::4] = out2
+        out[3::4] = out3
+        cp.cuda.Stream.null.synchronize()
+
+    gpu4_times = []
+    for _ in range(10):
+        cp.cuda.Stream.null.synchronize()
+        t0 = time.perf_counter()
+        for _ in range(iterations):
+            out0, out1, out2, out3 = eval_prism_vec4(a0_vals_vec4, a1_vals_vec4, a2_vals_vec4, a3_vals_vec4, k_vec4)
+            out = cp.empty(samples, dtype=cp.float32)
+            out[0::4] = out0
+            out[1::4] = out1
+            out[2::4] = out2
+            out[3::4] = out3
+        cp.cuda.Stream.null.synchronize()
+        t1 = time.perf_counter()
+        gpu4_times.append((t1 - t0) * 1000)
+    gpu4_ms = np.mean(gpu4_times)
+    gpu4_mvals = (iterations * samples / 1e6) / (gpu4_ms / 1000)
+    print(f"Time: {gpu4_ms:.2f} ms")
+    print(f"Speed: {gpu4_mvals:.2f} M vals/sec")
+    print(f"Speedup vs scalar GPU: {gpu_ms / gpu4_ms:.2f}x\n")
+
+    # ===== Verify accuracy =====
+    print("--- Accuracy verification ---")
+    cpu_ref = np.sin(np.arange(samples) * TAU / samples)
+    gpu_out = cp.asnumpy(out)
+    max_err = np.max(np.abs(cpu_ref - gpu_out))
+    rms_err = np.sqrt(np.mean((cpu_ref - gpu_out)**2))
+    print(f"Max error: {max_err:.6e}")
+    print(f"RMS error: {rms_err:.6e}\n")
+
+    # ===== Memory compression =====
+    print("--- Compression ratio ---")
+    raw_bytes = samples * 4  # float32
+    prism_bytes = num_prisms * 4 * 4  # 4 floats per prism
+    print(f"Raw samples: {raw_bytes/1024:.1f} KB")
+    print(f"Prism coeffs: {prism_bytes/1024:.1f} KB")
+    print(f"Compression ratio: {raw_bytes / prism_bytes:.1f}x\n")
+
+    return {
+        'cpu_mvals': cpu_mvals,
+        'gpu_scalar_mvals': gpu_mvals,
+        'gpu_vec4_mvals': gpu4_mvals,
+        'speedup_scalar': cpu_mvals / gpu_mvals,
+        'speedup_vec4': cpu_mvals / gpu4_mvals,
+        'max_error': max_err,
+        'rms_error': rms_err,
+        'compression_ratio': raw_bytes / prism_bytes
+    }
+
+# ============================================================
+# RUN BENCHMARK
+# ============================================================
+
+if __name__ == "__main__":
+    # Check if GPU is available
+    try:
+        gpu = cp.cuda.Device(0)
+        print(f"GPU: {gpu.name()}\n")
+    except:
+        print("No GPU found! Make sure Runtime → Change runtime type → GPU")
+        exit()
+
+    # Run benchmark with different tile sizes
+    results = {}
+    for tile in [64, 128, 256, 512]:
+        print(f"\n{'='*60}")
+        print(f"Testing tile size: {tile}")
+        results[tile] = benchmark(samples=32768, tile_size=tile, iterations=500)
+
+    # Summary
+    print(f"\n{'='*60}")
+    print("SUMMARY")
+    print(f"{'='*60}\n")
+    print(f"{'Tile':<8} {'Speedup (scalar)':<18} {'Speedup (vec4)':<18} {'Compression':<12}")
+    print("-" * 60)
+    for tile, r in results.items():
+        print(f"{tile:<8} {r['speedup_scalar']:<18.2f} {r['speedup_vec4']:<18.2f} {r['compression_ratio']:<12.1f}x")
